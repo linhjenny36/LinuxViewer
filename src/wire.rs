@@ -1,10 +1,9 @@
-//! Byte-level pieces of the UltraViewer protocol. Each item names the Swift file
-//! in Sources/UltraViewerProtocol it mirrors; keep them byte-compatible.
+//! Byte-level pieces of the UltraViewer protocol, ported from MacViewer's
+//! Sources/UltraViewerProtocol. Each section names the Swift file it must stay byte-compatible with.
 
 use cbc::cipher::{block_padding::Pkcs7, BlockEncryptMut, KeyIvInit};
 use md5::{Digest, Md5};
 use sha1::Sha1;
-use std::fmt;
 
 pub type Error = Box<dyn std::error::Error + Send + Sync>;
 pub type Result<T> = std::result::Result<T, Error>;
@@ -39,13 +38,6 @@ impl Ipv4 {
             ip[i] = p.parse().map_err(|_| bad())?;
         }
         Ok(Ipv4(ip))
-    }
-}
-
-impl fmt::Display for Ipv4 {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        let [a, b, c, d] = self.0;
-        write!(f, "{a}.{b}.{c}.{d}")
     }
 }
 
@@ -155,7 +147,7 @@ impl CommandCipher {
         CommandCipher { key, iv }
     }
 
-    /// The constant cipher for desktop/server commands (desktop VA 0x635a8c).
+    /// The fixed key UltraViewer uses for commands to its server.
     pub fn server() -> Self {
         Self::new("\u{5}\u{a}\u{f}\u{14}\u{19}")
     }

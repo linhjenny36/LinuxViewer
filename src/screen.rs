@@ -6,10 +6,10 @@ use std::collections::HashMap;
 use std::fmt;
 use zstd_safe::{DCtx, DParameter, InBuffer, OutBuffer, ResetDirective};
 
-/// UltraViewer's trained zstd dictionary, shared with the Swift package.
-static SCREEN_DICTIONARY: &[u8] = include_bytes!("../../Sources/UltraViewerProtocol/Resources/8bit.dat");
+/// UltraViewer's trained zstd dictionary, copied from MacViewer's Swift package.
+static SCREEN_DICTIONARY: &[u8] = include_bytes!("../assets/8bit.dat");
 
-/// Form1.ResetLastMsgNumber (0x80000001).
+/// The frame number a fresh screen counts from (0x80000001).
 pub const RESET_FRAME_NUMBER: i32 = -2147483647;
 
 const MAX_DIMENSION: i64 = 8192;
@@ -77,6 +77,9 @@ pub struct ScreenInit {
     pub height: usize,
     pub tile_size: usize,
     pub version: String,
+    /// Top-left of the Windows virtual desktop; mouse coordinates are relative to it.
+    pub virtual_left: i32,
+    pub virtual_top: i32,
 }
 
 pub fn decode_screen_init(parts: &[&[u8]]) -> Result<ScreenInit> {
@@ -97,9 +100,9 @@ pub fn decode_screen_init(parts: &[&[u8]]) -> Result<ScreenInit> {
     if parts.get(12).is_some_and(|p| p.len() < 2) {
         return Err(bad(12));
     }
+    let (mut virtual_left, mut virtual_top) = (0, 0);
     if parts.len() > 8 {
-        int32_part(parts, 9)?;
-        int32_part(parts, 10)?;
+        (virtual_left, virtual_top) = (int32_part(parts, 9)?, int32_part(parts, 10)?);
     }
     let mut tile_size = 16;
     if let Some(p) = parts.get(14) {
@@ -109,7 +112,7 @@ pub fn decode_screen_init(parts: &[&[u8]]) -> Result<ScreenInit> {
         }
     }
     let version = parts.get(6).map(|p| String::from_utf8_lossy(p).into_owned()).unwrap_or_default();
-    Ok(ScreenInit { width: w as usize, height: h as usize, tile_size, version })
+    Ok(ScreenInit { width: w as usize, height: h as usize, tile_size, version, virtual_left, virtual_top })
 }
 
 // --- command 1 ---
@@ -210,7 +213,7 @@ fn read_region(b: &[u8], off: usize, signed: bool) -> Result<Region> {
 
 // --- ZstdScreenDecoder.swift ---
 
-/// Keeps the screen dictionary loaded across missions.
+/// Keeps the screen dictionary loaded across screen updates.
 pub struct ZstdDecoder(DCtx<'static>);
 
 fn zstd(code: zstd_safe::SafeResult) -> Result<usize> {
@@ -221,7 +224,7 @@ impl ZstdDecoder {
     pub fn new() -> Result<Self> {
         let mut d = DCtx::create();
         zstd(d.load_dictionary(SCREEN_DICTIONARY))?;
-        // The UVC header rejects windows above 0x8000000 bytes.
+        // Windows never sends frames with a window above 128 MiB; refuse bigger ones.
         zstd(d.set_parameter(DParameter::WindowLogMax(27)))?;
         Ok(ZstdDecoder(d))
     }

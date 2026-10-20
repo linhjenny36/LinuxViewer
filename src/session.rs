@@ -1,6 +1,8 @@
-//! A view-only relay session (UltraViewerRelaySession.swift): register, look up the
-//! partner, log in through the relay and stream the screen.
+//! A relay session (UltraViewerRelaySession.swift): register, look up the partner,
+//! log in through the relay, stream the screen and audio, and send mouse and keyboard input.
 
+use crate::audio::{self, G722};
+use crate::input::{KeyboardEncoder, Mouse, MouseEncoder};
 use crate::messages::{login_text, lookup_text, parse_lookup_reply, parse_registration_reply, version_at_least, LoginContext, PeerInfo, Registration};
 use crate::screen::{decode_screen_frame, decode_screen_init, Renderer, ScreenError, RESET_FRAME_NUMBER};
 use crate::wire::{decode_envelope, decode_multipart, encode_frame, forward_envelope, http_preamble, random_string, system_envelope, CommandCipher, Envelope, Ipv4, Result, MAX_FRAME};
@@ -22,7 +24,7 @@ const WRONG_PASSWORD: &str = "UltraViewer rejected the partner password";
 const STEP_TIMEOUT: Duration = Duration::from_secs(20);
 const HEARTBEAT: Duration = Duration::from_secs(10);
 
-/// Everything a view-only session needs from the app. Callbacks run on the session thread.
+/// Everything a session needs from the app. Callbacks run on the session thread.
 pub struct Config {
     pub registration: Registration,
     /// This viewer's screen, reported in Login.
@@ -32,10 +34,15 @@ pub struct Config {
     pub on_status: Box<dyn FnMut(&str) + Send>,
     /// Top-down RGBA pixels, width, height. The buffer is reused; copy it.
     pub on_frame: Box<dyn FnMut(&[u8], usize, usize) + Send>,
-    pub on_peer_changed: Box<dyn FnMut(&str, usize, usize) + Send>,
+    /// The Windows computer's name, once it accepts the session.
+    pub on_peer_changed: Box<dyn FnMut(&str) + Send>,
+    /// Ask Windows to stream its computer audio from the start.
+    pub sound: bool,
+    /// 48 kHz stereo s16le PCM.
+    pub on_audio: Box<dyn FnMut(&[u8]) + Send>,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy)]
 pub enum Source {
     Command,
     Peer,
@@ -45,6 +52,14 @@ pub enum Source {
 pub enum Event {
     Frame(Source, Vec<u8>),
     Closed(Option<io::Error>),
+    /// Pointer input in remote screen pixels, from the window.
+    Mouse(Mouse),
+    /// A physical key went down (true) or up, from the window.
+    Key(winit::keyboard::KeyCode, bool),
+    /// Lift every held key and button, e.g. when the window loses focus.
+    ReleaseAll,
+    /// Turn the Windows computer's audio on or off.
+    Sound(bool),
     /// Sent by the app to end the session.
     Quit,
 }
@@ -264,6 +279,16 @@ struct Session {
     deadline: Option<Instant>,
     next_heartbeat: Option<Instant>,
     ticks: u32,
+    mouse: MouseEncoder,
+    keyboard: KeyboardEncoder,
+    /// Windows UltraViewer 6.2.13+ accepts the binary keyboard message.
+    keyboard_ok: bool,
+    /// Set by Windows (command 49) when its user allows viewing only.
+    view_only: bool,
+    origin: (i32, i32),
+    audio: Option<G722>,
+    sound: bool,
+    sound_requested: bool,
 }
 
 /// Connects to `partner_id` and streams its screen until `Event::Quit` arrives or the session fails.
@@ -278,13 +303,15 @@ pub fn run(cfg: Config, partner_id: &str, password: &str, tx: SyncSender<Event>,
     let stream = dial("", COMMAND_HOST).map_err(|e| format!("the UltraViewer service did not respond: {e}"))?;
     let mut cmd = RelayConn::open(stream, COMMAND_HOST, Source::Command, tx.clone())?;
     cmd.send(&system_envelope(&CommandCipher::server().encrypt(reg_text.as_bytes()), true))?;
-    let correlation = i32::from_str_radix(&random_string(9, b"0123456789"), 10).expect("digits") + 1;
+    let correlation = random_string(9, b"0123456789").parse::<i32>().expect("digits") + 1;
+    let sound = cfg.sound;
     let mut s = Session {
         cfg, partner_id: partner_id.into(), password: password.into(),
         hash: random_string(16, b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"),
         correlation, phase: Phase::Registering, cmd, peer: None, assigned_id: String::new(), info: None,
         target: Ipv4::default(), target_port: 0, render: None, accepted: false, refreshes: 0,
         deadline: Some(Instant::now() + STEP_TIMEOUT), next_heartbeat: None, ticks: 0,
+        mouse: MouseEncoder::default(), keyboard: KeyboardEncoder::default(), keyboard_ok: false, view_only: false, origin: (0, 0), audio: None, sound, sound_requested: false,
     };
     loop {
         let wake = [s.deadline, s.next_heartbeat].into_iter().flatten().min();
@@ -317,6 +344,10 @@ pub fn run(cfg: Config, partner_id: &str, password: &str, tx: SyncSender<Event>,
             }
             Ok(Event::Frame(Source::Command, f)) => s.on_command(&f, dial, &tx)?,
             Ok(Event::Frame(Source::Peer, f)) => s.on_peer(&f)?,
+            Ok(Event::Mouse(m)) => s.on_mouse(m)?,
+            Ok(Event::Key(code, pressed)) => s.on_key(code, pressed)?,
+            Ok(Event::ReleaseAll) => s.release_all()?,
+            Ok(Event::Sound(on)) => s.set_sound(on)?,
         }
     }
 }
@@ -360,7 +391,11 @@ impl Session {
                 return Err(WRONG_PASSWORD.into());
             }
             let Some(info) = reply.peer else {
-                return Err(format!("UltraViewer declined the partner lookup (code {})", reply.status).into());
+                return Err(match reply.status {
+                    // Seen for an ID that doesn't exist or isn't online.
+                    11 => "UltraViewer couldn't find that computer (code 11). Check the ID and that UltraViewer is running on it.".into(),
+                    code => format!("UltraViewer declined the partner lookup (code {code})").into(),
+                });
             };
             (self.target, self.target_port, self.phase) = (info.public_ip, info.target_port, Phase::LoggingIn);
             (self.cfg.on_status)("Connecting to the Windows computer…");
@@ -373,24 +408,29 @@ impl Session {
             self.info = Some(info);
             (self.cfg.on_status)("Waiting for Windows to accept the session…");
             self.arm_deadline();
-            self.login(0, false)?;
+            self.login(0)?;
         }
         Ok(())
     }
 
-    fn login(&mut self, control_mode: i32, clear: bool) -> Result<()> {
+    fn login(&mut self, control_mode: i32) -> Result<()> {
         let info = self.info.as_ref().expect("login after lookup");
         let text = login_text(&self.password, &random_string(8, b"0123456789"), &LoginContext {
             screen_width: self.cfg.screen_width, screen_height: self.cfg.screen_height,
             local_id: &self.assigned_id, display_name: &self.cfg.display_name,
-            control_mode, clear_control_mode: clear,
+            control_mode,
             connection_hash: &self.hash, partner_secret_token: &info.secret_token,
         })?;
         self.send_to_peer(text.as_bytes())
     }
 
     fn send_to_peer(&mut self, payload: &[u8]) -> Result<()> {
-        let env = forward_envelope(self.target, self.target_port, false, payload);
+        self.send_to_peer_flagged(payload, false)
+    }
+
+    /// `unicode` marks a UTF-16LE payload (the envelope's format flag).
+    fn send_to_peer_flagged(&mut self, payload: &[u8], unicode: bool) -> Result<()> {
+        let env = forward_envelope(self.target, self.target_port, unicode, payload);
         Ok(self.peer.as_mut().expect("peer connected").send(&env)?)
     }
 
@@ -402,26 +442,17 @@ impl Session {
         self.peer.as_mut().expect("peer connected").send(&system_envelope(b"ping", false))?;
         self.send_to_peer(b"20")?;
         if self.ticks % 6 == 0 {
-            // frmMain.tmPingServer: encrypted "2" every sixty seconds
+            // The Windows viewer also keeps the server registration alive every minute.
             self.cmd.send(&system_envelope(&CommandCipher::server().encrypt(b"2"), true))?;
         }
         Ok(())
     }
 
-    /// Renegotiates a complete screen after a bad update (refreshScreen in Swift).
-    fn refresh(&mut self) -> Result<()> {
-        self.refreshes += 1;
-        self.render = None;
-        self.phase = Phase::LoggingIn;
-        (self.cfg.on_status)("Refreshing the Windows screen…");
-        self.arm_deadline();
-        self.login(-1, true)
-    }
-
-    fn relogin(&mut self, clear: bool) -> Result<()> {
+    /// Logs in again on the open connection; `control_mode` 0 asks for a full screen.
+    fn relogin(&mut self, control_mode: i32) -> Result<()> {
         self.phase = Phase::LoggingIn;
         self.arm_deadline();
-        self.login(-1, clear)
+        self.login(control_mode)
     }
 
     fn on_peer(&mut self, frame: &[u8]) -> Result<()> {
@@ -443,16 +474,35 @@ impl Session {
         match command {
             0 if matches!(self.phase, Phase::LoggingIn | Phase::Active) => self.on_screen_init(&parts),
             1 if self.phase == Phase::Active && self.render.is_some() => self.on_screen_frame(&parts),
-            23 if self.phase == Phase::Active => self.relogin(false),
+            23 if self.phase == Phase::Active => self.relogin(-1),
             26 if ours => {
                 (self.target, self.target_port, self.render) = (ip, port, None);
                 if self.phase == Phase::Active {
-                    return self.relogin(true);
+                    return self.relogin(0);
                 }
                 Ok(())
             }
             27 | 41 | 54 => Err(CLOSED.into()),
             39 => Err("the Windows computer blocked this connection".into()),
+            42 | 43 if self.phase == Phase::Active && self.sound => {
+                let decoder = match &mut self.audio {
+                    Some(d) => d,
+                    None => self.audio.insert(G722::new()?),
+                };
+                // A bad audio packet is skipped, like MacViewer; it must not end the session.
+                if let Ok(pcm) = audio::decode_message(&parts, decoder) {
+                    (self.cfg.on_audio)(&pcm);
+                }
+                Ok(())
+            }
+            49 => {
+                let Some(&flag) = parts.get(1).and_then(|p| p.first()) else {
+                    return Err("the Windows computer returned incomplete screen information".into());
+                };
+                self.view_only = flag != 0;
+                (self.cfg.on_status)(if self.view_only { "The Windows computer allows viewing only." } else { "Remote control is allowed." });
+                Ok(())
+            }
             48 if self.phase == Phase::Active => match &mut self.render {
                 Some(r) => r.set_tile_size(&parts),
                 None => Ok(()),
@@ -485,15 +535,74 @@ impl Session {
             Ok(b) if !b.is_empty() => String::from_utf8_lossy(&b).into_owned(),
             _ => self.partner_id.clone(),
         };
-        (self.cfg.on_peer_changed)(&name, si.width, si.height);
+        (self.cfg.on_peer_changed)(&name);
+        self.origin = (si.virtual_left, si.virtual_top);
+        self.keyboard_ok = version_at_least(&si.version, [6, 2, 13]);
         let status = if self.accepted {
             "Windows screen refreshed.".to_string()
-        } else {
+        } else if self.keyboard_ok {
             format!("Connected to {name} (UltraViewer {}, {}x{}).", si.version, si.width, si.height)
+        } else {
+            format!("Connected to {name} (UltraViewer {}); its keyboard input needs 6.2.13 or later, so mouse only.", si.version)
         };
         (self.cfg.on_status)(&status);
         self.accepted = true;
-        self.send_to_peer(b"17")
+        self.send_to_peer(b"17")?;
+        if self.sound && !self.sound_requested {
+            self.set_sound(true)?;
+        }
+        Ok(())
+    }
+
+    /// RemoteControlCommands.computerSound, sent as UTF-16LE.
+    fn set_sound(&mut self, on: bool) -> Result<()> {
+        self.sound = on;
+        if self.phase != Phase::Active {
+            return Ok(()); // sent once the screen arrives
+        }
+        self.sound_requested = true;
+        let text: Vec<u8> = format!("46|||{}", if on { -1 } else { 0 }).encode_utf16().flat_map(u16::to_le_bytes).collect();
+        self.send_to_peer_flagged(&text, true)
+    }
+
+    /// Sends pointer input while Windows allows control; coordinates are clamped to
+    /// the screen and moved into Windows virtual-desktop space.
+    fn on_mouse(&mut self, m: Mouse) -> Result<()> {
+        let Some(r) = &self.render else { return Ok(()) };
+        if self.phase != Phase::Active || self.view_only {
+            return Ok(());
+        }
+        let m = match m {
+            Mouse::Move { x, y } => Mouse::Move {
+                x: x.clamp(0, r.width as i32 - 1) + self.origin.0,
+                y: y.clamp(0, r.height as i32 - 1) + self.origin.1,
+            },
+            other => other,
+        };
+        for payload in self.mouse.encode(m) {
+            self.send_to_peer(&payload)?;
+        }
+        Ok(())
+    }
+
+    fn release_all(&mut self) -> Result<()> {
+        if self.phase != Phase::Active {
+            return Ok(());
+        }
+        for payload in self.keyboard.release_all().into_iter().chain(self.mouse.release_all()) {
+            self.send_to_peer(&payload)?;
+        }
+        Ok(())
+    }
+
+    fn on_key(&mut self, code: winit::keyboard::KeyCode, pressed: bool) -> Result<()> {
+        if self.phase != Phase::Active || self.view_only || !self.keyboard_ok {
+            return Ok(());
+        }
+        for payload in self.keyboard.encode(code, pressed) {
+            self.send_to_peer(&payload)?;
+        }
+        Ok(())
     }
 
     fn on_screen_frame(&mut self, parts: &[&[u8]]) -> Result<()> {
@@ -509,8 +618,11 @@ impl Session {
                 if self.refreshes >= 2 {
                     return Err(e);
                 }
+                // A damaged tile cache can't be trusted: start over from a full screen.
                 (self.cfg.on_status)(&format!("Bad screen update ({e}); refreshing."));
-                self.refresh()
+                self.refreshes += 1;
+                self.render = None;
+                self.relogin(0)
             }
             Err(e) => Err(e),
         }
@@ -614,20 +726,34 @@ mod tests {
             f.write(&forward_envelope(Ipv4([1, 2, 3, 4]), 9, false, &encode_multipart(&[&[27]])));
             send(&mut f, &[vec![0], long(2), long(1), vec![], vec![], vec![1], b"6.6.133".to_vec(), vec![1]]);
             expect(&mut f, "17");
+            let sound = f.read();
+            let want: Vec<u8> = "46|||-1".encode_utf16().flat_map(u16::to_le_bytes).collect();
+            assert_eq!((sound[1], &sound[8..]), (1, &want[..]), "sound request is flagged UTF-16LE");
             send(&mut f, &parts(&Fp { seq: RESET_FRAME_NUMBER + 1, rects: vec![0, 0, 2, 1], pixels: words(&[0x7c00, 0x001f]), ..Default::default() }));
             expect(&mut f, "18");
+            expect(&mut f, "8|||512|||0|||1|||0"); // the frame callback's move, clamped to the 2x1 screen
+            expect(&mut f, "\u{1e}|||\u{1}A\u{1e}\0a\0\0"); // its 'a' key-down
+            send(&mut f, &[vec![43], vec![0, 1]]);
             send(&mut f, &[vec![27]]);
             f.drain();
         });
 
+        let (tx, rx) = sync_channel(64);
+        let audio = Arc::new(Mutex::new(0));
         let frames = Arc::new(Mutex::new(vec![]));
         let name = Arc::new(Mutex::new(String::new()));
-        let (fr, nm) = (frames.clone(), name.clone());
+        let (fr, nm, au, input) = (frames.clone(), name.clone(), audio.clone(), tx.clone());
         let cfg = Config {
             registration: sample_registration(), screen_width: 1920, screen_height: 1080, display_name: "LinuxViewer".into(),
             on_status: Box::new(|_| {}),
-            on_frame: Box::new(move |px, _, _| fr.lock().unwrap().push(px.to_vec())),
-            on_peer_changed: Box::new(move |n, _, _| *nm.lock().unwrap() = n.into()),
+            on_frame: Box::new(move |px, _, _| {
+                fr.lock().unwrap().push(px.to_vec());
+                input.try_send(Event::Mouse(Mouse::Move { x: 9, y: -3 })).unwrap();
+                input.try_send(Event::Key(winit::keyboard::KeyCode::KeyA, true)).unwrap();
+            }),
+            on_peer_changed: Box::new(move |n| *nm.lock().unwrap() = n.into()),
+            sound: true,
+            on_audio: Box::new(move |pcm| *au.lock().unwrap() += pcm.len()),
         };
         let dial = move |address: &str, cert_name: &str| {
             if address.is_empty() {
@@ -636,10 +762,10 @@ mod tests {
             assert_eq!((address, cert_name), ("198.51.100.2", "relay.example"));
             plain(peer_addr)
         };
-        let (tx, rx) = sync_channel(64);
         let err = run(cfg, "123456789", "pw", tx, rx, &dial).unwrap_err();
         assert_eq!(err.to_string(), CLOSED);
         assert_eq!(*name.lock().unwrap(), "WINPC");
+        assert_eq!(*audio.lock().unwrap(), 8, "two G.722 bytes play as eight PCM bytes");
         assert_eq!(*frames.lock().unwrap(), [vec![255, 0, 0, 255, 0, 0, 255, 255]]);
         cmd_server.join().unwrap();
         peer_server.join().unwrap();

@@ -5,7 +5,6 @@ use crate::wire::{join_fields, md5_hex, Ipv4, Result};
 pub const CLIENT_VERSION: &str = "6.6.133";
 
 /// ClientRegistration.Request with the values MacViewer sends.
-#[derive(Clone, Debug, Default)]
 pub struct Registration {
     pub device_identity: String,   // 32 uppercase hex chars, stable per install
     pub password: String,          // 8 digits, stable per install
@@ -54,7 +53,6 @@ pub fn lookup_text(target_id: &str, password: &str, local_id: &str, local_passwo
     ])
 }
 
-#[derive(Clone, Debug, PartialEq)]
 pub struct PeerInfo {
     pub public_ip: Ipv4,
     pub target_port: u16,
@@ -103,8 +101,8 @@ pub struct LoginContext<'a> {
     pub screen_height: u32,
     pub local_id: &'a str,
     pub display_name: &'a str,
+    /// 0 asks for a full screen; -1 resumes the current one.
     pub control_mode: i32,
-    pub clear_control_mode: bool,
     pub connection_hash: &'a str,
     pub partner_secret_token: &'a str,
 }
@@ -118,11 +116,10 @@ pub fn login_text(password: &str, nonce: &str, c: &LoginContext) -> Result<Strin
         return Err("login fields must be ASCII".into());
     }
     let name: String = c.display_name.chars().filter(|ch| !"!#$&?:/\\*,.@<>;'\"=".contains(*ch)).take(20).collect();
-    let mode = if c.clear_control_mode { 0 } else { c.control_mode };
     join_fields(&[
         "login", nonce, &md5_hex(&format!("{nonce}{password}")),
         &c.screen_width.to_string(), &c.screen_height.to_string(), "0", "15", "15", "0", "0",
-        c.local_id, &name, &mode.to_string(), &md5_hex(&(" ".repeat(32) + password)),
+        c.local_id, &name, &c.control_mode.to_string(), &md5_hex(&(" ".repeat(32) + password)),
         "", c.connection_hash, "2", "45", "0", "0",
         c.partner_secret_token, CLIENT_VERSION, "0",
     ])
@@ -178,7 +175,7 @@ pub(crate) mod tests {
 
         let login = login_text("pw", "12345678", &LoginContext {
             screen_width: 1920, screen_height: 1080, local_id: "111",
-            display_name: "Linux:Viewer.With/A Very Long Name", control_mode: -1, clear_control_mode: true,
+            display_name: "Linux:Viewer.With/A Very Long Name", control_mode: 0,
             connection_hash: "H", partner_secret_token: "S",
         }).unwrap();
         let f: Vec<&str> = login.split(':').collect();
@@ -195,8 +192,8 @@ pub(crate) mod tests {
         let r = parse_lookup_reply(b"8:1:192.0.2.9:unused:203.0.113.9:54000:5900:1:bmFtZQ==:55100:x:198.51.100.2:0:3:relay.example:a:b:c:d:e:secret:direct-info:77").unwrap();
         let p = r.peer.unwrap();
         assert_eq!((r.status, r.correlation), (1, Some(77)));
-        assert_eq!((p.public_ip.to_string().as_str(), p.target_port, p.relay_ip.as_str(), p.relay_hostname.as_str(), p.secret_token.as_str()),
-                   ("203.0.113.9", 55100, "198.51.100.2", "relay.example", "secret"));
+        assert_eq!((p.public_ip, p.target_port, p.relay_ip.as_str(), p.relay_hostname.as_str(), p.secret_token.as_str()),
+                   (Ipv4([203, 0, 113, 9]), 55100, "198.51.100.2", "relay.example", "secret"));
         let wrong = parse_lookup_reply(b"8:2:77").unwrap();
         assert!(wrong.status == 2 && wrong.peer.is_none());
         assert!(version_at_least("6.6.133", [6, 0, 0]) && !version_at_least("5.9.9", [6, 0, 0]) && !version_at_least("6.0", [6, 0, 0]));
