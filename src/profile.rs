@@ -1,5 +1,5 @@
 //! The install identity and the machine details sent in registration
-//! (MacRegistrationProfile.swift). Shares its file with the Go viewer.
+//! (MacRegistrationProfile.swift).
 
 use crate::messages::Registration;
 use crate::wire::{hex, random_bytes, random_string, Result};
@@ -20,7 +20,7 @@ fn config_dir() -> Result<PathBuf> {
 }
 
 /// The string value of `"key": "value"` in our own flat JSON file.
-fn json_field(text: &str, key: &str) -> Option<String> {
+pub(crate) fn json_field(text: &str, key: &str) -> Option<String> {
     let rest = &text[text.find(&format!("\"{key}\""))? + key.len() + 2..];
     let rest = rest.trim_start().strip_prefix(':')?.trim_start().strip_prefix('"')?;
     Some(rest[..rest.find('"')?].to_string())

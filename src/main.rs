@@ -1,11 +1,14 @@
-//! uvview shows a Windows PC's screen over UltraViewer, view-only.
+//! uvview shows and controls a Windows PC over UltraViewer.
 
+mod audio;
+mod input;
 mod messages;
 mod profile;
 mod screen;
 mod session;
 mod wire;
 
+use input::Mouse;
 use session::{Config, Event};
 use softbuffer::{Context, Surface};
 use std::num::NonZeroU32;
@@ -17,11 +20,12 @@ use std::thread;
 use std::time::{Duration, Instant};
 use winit::application::ApplicationHandler;
 use winit::dpi::LogicalSize;
-use winit::event::WindowEvent;
+use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, EventLoop, EventLoopProxy};
+use winit::keyboard::PhysicalKey;
 use winit::window::{Window, WindowId};
 
-const USAGE: &str = "usage: uvview --id <ID> [--snapshot screen.png]\n\nThe password is read from $UV_PASSWORD or asked for.";
+const USAGE: &str = "usage: uvview --id <ID> [--sound] [--snapshot screen.png]\n\n  --sound      play the Windows computer's audio\n  --snapshot   save the first screen to a PNG file and exit (no window)\n\nThe password is read from $UV_PASSWORD or asked for.";
 
 fn fail(msg: impl std::fmt::Display) -> ! {
     eprintln!("uvview: {msg}");
@@ -29,12 +33,13 @@ fn fail(msg: impl std::fmt::Display) -> ! {
 }
 
 fn main() {
-    let (mut id, mut snapshot) = (String::new(), None);
+    let (mut id, mut snapshot, mut sound) = (String::new(), None, false);
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
         match a.trim_start_matches('-') {
             "id" => id = args.next().unwrap_or_default(),
             "snapshot" => snapshot = args.next(),
+            "sound" => sound = true,
             _ => {
                 eprintln!("{USAGE}");
                 exit(2)
@@ -55,11 +60,13 @@ fn main() {
         registration, screen_width: 1920, screen_height: 1080, display_name: "LinuxViewer".into(),
         on_status: Box::new(|s| eprintln!("{s}")),
         on_frame: Box::new(|_, _, _| {}),
-        on_peer_changed: Box::new(|_, _, _| {}),
+        on_peer_changed: Box::new(|_| {}),
+        sound: false,
+        on_audio: Box::new(|_| {}),
     };
     match snapshot {
         Some(path) => run_snapshot(cfg, &id, &password, &path),
-        None => run_window(cfg, id, password),
+        None => run_window(cfg, id, password, sound),
     }
 }
 
@@ -118,10 +125,13 @@ impl Ui {
 struct App {
     shared: Arc<Mutex<Shared>>,
     window: Option<(Rc<Window>, Surface<Rc<Window>, Rc<Window>>)>,
-    quit: SyncSender<Event>,
+    /// Carries input and the final Quit to the session thread.
+    tx: SyncSender<Event>,
+    /// Unsent fraction of a wheel notch (touchpads scroll in pixels).
+    wheel_rest: f64,
 }
 
-fn run_window(mut cfg: Config, id: String, password: String) {
+fn run_window(mut cfg: Config, id: String, password: String, sound: bool) {
     let event_loop = EventLoop::<()>::with_user_event().build().unwrap_or_else(|e| fail(e));
     let shared = Arc::new(Mutex::new(Shared { label: format!("UltraViewer {id}"), status: "Connecting…".into(), ..Default::default() }));
     let ui = Ui { shared: shared.clone(), proxy: event_loop.create_proxy() };
@@ -131,13 +141,23 @@ fn run_window(mut cfg: Config, id: String, password: String) {
         status.update(|sh| sh.status = s.into());
     });
     let (label, id2) = (ui.clone(), id.clone());
-    cfg.on_peer_changed = Box::new(move |name, _, _| label.update(|sh| sh.label = format!("{name} ({id2})")));
+    cfg.on_peer_changed = Box::new(move |name| label.update(|sh| sh.label = format!("{name} ({id2})")));
     let frame = ui.clone();
     cfg.on_frame = Box::new(move |px, w, h| frame.update(|sh| {
         sh.pix.clear();
         sh.pix.extend_from_slice(px);
         (sh.w, sh.h) = (w, h);
     }));
+
+    if sound {
+        match audio::Player::start() {
+            Ok(player) => {
+                cfg.sound = true;
+                cfg.on_audio = Box::new(move |pcm| player.play(pcm));
+            }
+            Err(e) => eprintln!("uvview: sound is off: {e}"),
+        }
+    }
 
     let (tx, rx) = sync_channel(64);
     let session_tx = tx.clone();
@@ -148,11 +168,11 @@ fn run_window(mut cfg: Config, id: String, password: String) {
         }
     });
 
-    let mut app = App { shared, window: None, quit: tx };
+    let mut app = App { shared, window: None, tx, wheel_rest: 0.0 };
     if let Err(e) = event_loop.run_app(&mut app) {
         eprintln!("uvview: {e}");
     }
-    let _ = app.quit.send(Event::Quit);
+    let _ = app.tx.send(Event::Quit);
     let start = Instant::now(); // let the session tell Windows we left
     while !worker.is_finished() && start.elapsed() < Duration::from_secs(2) {
         thread::sleep(Duration::from_millis(20));
@@ -181,6 +201,46 @@ impl ApplicationHandler for App {
         let Some((window, surface)) = &mut self.window else { return };
         match event {
             WindowEvent::CloseRequested => el.exit(),
+            WindowEvent::CursorMoved { position, .. } => {
+                let sh = self.shared.lock().unwrap();
+                let size = window.inner_size();
+                let (ox, oy, w, h) = fit(size.width as usize, size.height as usize, sh.w, sh.h);
+                if w > 0 {
+                    // Window pixels to remote pixels; the session clamps points outside the screen.
+                    let x = ((position.x - ox as f64) * sh.w as f64 / w as f64).floor() as i32;
+                    let y = ((position.y - oy as f64) * sh.h as f64 / h as f64).floor() as i32;
+                    let _ = self.tx.try_send(Event::Mouse(Mouse::Move { x, y })); // a dropped move is harmless
+                }
+            }
+            WindowEvent::MouseInput { state, button, .. } => {
+                let button = match button {
+                    MouseButton::Left => 0,
+                    MouseButton::Right => 1,
+                    MouseButton::Middle => 2,
+                    _ => return,
+                };
+                let _ = self.tx.send(Event::Mouse(Mouse::Button { button, pressed: state == ElementState::Pressed }));
+            }
+            WindowEvent::MouseWheel { delta, .. } => {
+                // shortcut: 40 touchpad pixels per notch; tune if touchpad scrolling feels off.
+                self.wheel_rest += match delta {
+                    MouseScrollDelta::LineDelta(_, y) => y as f64,
+                    MouseScrollDelta::PixelDelta(p) => p.y / 40.0,
+                };
+                let notches = self.wheel_rest.trunc();
+                self.wheel_rest -= notches;
+                if notches != 0.0 {
+                    let _ = self.tx.send(Event::Mouse(Mouse::Wheel(notches as i32)));
+                }
+            }
+            WindowEvent::KeyboardInput { event, .. } => {
+                if let PhysicalKey::Code(code) = event.physical_key {
+                    let _ = self.tx.send(Event::Key(code, event.state == ElementState::Pressed));
+                }
+            }
+            WindowEvent::Focused(false) => {
+                let _ = self.tx.send(Event::ReleaseAll);
+            }
             WindowEvent::RedrawRequested => {
                 let sh = self.shared.lock().unwrap();
                 window.set_title(&format!("{} — {}", sh.label, sh.status));
@@ -198,6 +258,16 @@ impl ApplicationHandler for App {
     }
 }
 
+/// Where the remote screen sits in the window: x, y, width, height (zero size before a frame).
+fn fit(dw: usize, dh: usize, sw: usize, sh: usize) -> (usize, usize, usize, usize) {
+    if sw == 0 || sh == 0 || dw == 0 || dh == 0 {
+        return (0, 0, 0, 0);
+    }
+    let scale = (dw as f64 / sw as f64).min(dh as f64 / sh as f64);
+    let (w, h) = (((sw as f64 * scale) as usize).clamp(1, dw), ((sh as f64 * scale) as usize).clamp(1, dh));
+    ((dw - w) / 2, (dh - h) / 2, w, h)
+}
+
 /// Scales the remote screen to fit, keeping its aspect ratio, into 0RGB pixels.
 /// shortcut: nearest-neighbour scaling on the CPU; switch to a GPU blit if large screens stutter.
 fn draw_fit(dst: &mut [u32], dw: usize, dh: usize, src: &[u8], sw: usize, sh: usize) {
@@ -205,9 +275,7 @@ fn draw_fit(dst: &mut [u32], dw: usize, dh: usize, src: &[u8], sw: usize, sh: us
     if sw == 0 || sh == 0 || src.len() < sw * sh * 4 {
         return;
     }
-    let scale = (dw as f64 / sw as f64).min(dh as f64 / sh as f64);
-    let (w, h) = (((sw as f64 * scale) as usize).clamp(1, dw), ((sh as f64 * scale) as usize).clamp(1, dh));
-    let (ox, oy) = ((dw - w) / 2, (dh - h) / 2);
+    let (ox, oy, w, h) = fit(dw, dh, sw, sh);
     let xs: Vec<usize> = (0..w).map(|x| (x * sw / w) * 4).collect();
     for y in 0..h {
         let row = &src[(y * sh / h) * sw * 4..];

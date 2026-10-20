@@ -2,7 +2,7 @@
 name = "uvview"
 version = "0.1.0"
 edition = "2021"
-description = "View-only UltraViewer client for Linux (port of MacViewer's screen path)"
+description = "UltraViewer client for Linux: screen, mouse control and computer audio (port of MacViewer)"
 license = "MIT"
 
 [dependencies]
@@ -21,6 +21,9 @@ softbuffer = "0.4"
 webpki-roots = "1"
 winit = "0.30"
 zstd-safe = "7"
+
+[build-dependencies]
+cc = "1"
 
 [profile.release]
 lto = "thin"
