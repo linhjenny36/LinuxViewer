@@ -40,14 +40,14 @@ jobs:
           META=$(cargo metadata --no-deps --format-version 1)
           VER=$(echo "$META" | jq -r '.packages[0].version')
           BIN=$(echo "$META" | jq -r '[.packages[].targets[] | select(.kind[] == "bin") | .name][0]')
-          if [[ "$GITHUB_REF_TYPE" == "tag" ]]; then
+          if [ "$GITHUB_REF_TYPE" = "tag" ]; then
             TAG="$GITHUB_REF_NAME"
           else
             TAG="v${VER}-build.${GITHUB_RUN_NUMBER}"
           fi
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
           echo "bin=$BIN" >> "$GITHUB_OUTPUT"
-          echo "### Release: \`$TAG\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "Release: $TAG" >> "$GITHUB_STEP_SUMMARY"
 
   package:
     needs: test
@@ -97,6 +97,9 @@ jobs:
           - { target: armv7-unknown-linux-musleabihf, arch: armv7 }
           - { target: arm-unknown-linux-musleabihf,   arch: armv6 }
           - { target: i686-unknown-linux-musl,        arch: "386" }
+    env:
+      TARGET: ${{ matrix.target }}
+      ARCH: ${{ matrix.arch }}
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -108,15 +111,14 @@ jobs:
       - uses: taiki-e/install-action@cross
 
       - name: Build
-        run: cross build --release --locked --target ${{ matrix.target }}
+        run: cross build --release --locked --target "$TARGET"
 
       - name: Stage
         run: |
           set -euo pipefail
           mkdir -p dist
-          for bin in $(cargo metadata --no-deps --format-version 1 \
-                        | jq -r '.packages[].targets[] | select(.kind[] == "bin") | .name'); do
-            cp "target/${{ matrix.target }}/release/$bin" "dist/${bin}-linux-${{ matrix.arch }}"
+          for bin in $(cargo metadata --no-deps --format-version 1 | jq -r '.packages[].targets[] | select(.kind[] == "bin") | .name'); do
+            cp "target/$TARGET/release/$bin" "dist/$bin-linux-$ARCH"
           done
           ls -la dist
 
@@ -147,6 +149,9 @@ jobs:
           - arch: "386"
             platform: linux/386
             images: alpine:latest busybox:latest
+    env:
+      PLATFORM: ${{ matrix.platform }}
+      IMAGES: ${{ matrix.images }}
     steps:
       - uses: docker/setup-qemu-action@v3
       - uses: actions/download-artifact@v4
@@ -154,7 +159,7 @@ jobs:
           name: dist-${{ matrix.arch }}
           path: dist
 
-      - name: Check static + run on distros
+      - name: Check static and run on distros
         run: |
           set -uo pipefail
           chmod +x dist/*
@@ -163,7 +168,83 @@ jobs:
             echo "=== $bin"
             file "$bin"
             if ! file "$bin" | grep -qE 'statically linked|static-pie linked'; then
-              echo "::error::$bin is not statically linked"; fail=1
+              echo "::error::$bin is not statically linked"
+              fail=1
             fi
-            for img in ${{ matrix.images }}; do
-              timeout 60 docker run --rm --platform ${{
+            for img in $IMAGES; do
+              timeout 60 docker run --rm --platform "$PLATFORM" -v "$PWD/dist:/dist:ro" "$img" "/$bin" --version
+              code=$?
+              case "$code" in
+                125|126|127|132|134|135|139)
+                  echo "::error::$bin failed on $img (exit $code)"
+                  fail=1
+                  ;;
+                *)
+                  echo "ok: $img (exit $code)"
+                  ;;
+              esac
+            done
+          done
+          exit $fail
+
+  release:
+    needs: [meta, verify]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      TAG: ${{ needs.meta.outputs.tag }}
+      BIN: ${{ needs.meta.outputs.bin }}
+      REPO: ${{ github.repository }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: dist-*
+          path: dist
+          merge-multiple: true
+
+      - name: Checksums
+        run: |
+          cd dist
+          chmod +x *
+          sha256sum * > checksums-sha256.txt
+          cat checksums-sha256.txt
+
+      - name: Release notes
+        run: |
+          URL="https://github.com/$REPO/releases/download/$TAG"
+          {
+            echo "## Install (any Linux)"
+            echo
+            echo '```bash'
+            echo 'case "$(uname -m)" in'
+            echo '  x86_64) A=amd64 ;; aarch64|arm64) A=arm64 ;;'
+            echo '  armv7l) A=armv7 ;; armv6l) A=armv6 ;; i?86) A=386 ;;'
+            echo '  *) echo "unsupported arch"; exit 1 ;;'
+            echo 'esac'
+            echo "curl -fL -o $BIN \"$URL/$BIN-linux-\$A\""
+            echo "chmod +x $BIN"
+            echo "sudo mv $BIN /usr/local/bin/"
+            echo '```'
+            echo
+            echo "| Arch | File |"
+            echo "|---|---|"
+            echo "| x86_64 | $BIN-linux-amd64 |"
+            echo "| ARM64 (Pi 4/5 64-bit) | $BIN-linux-arm64 |"
+            echo "| ARMv7 (Pi 2/3/4 32-bit) | $BIN-linux-armv7 |"
+            echo "| ARMv6 (Pi Zero/1) | $BIN-linux-armv6 |"
+            echo "| x86 32-bit | $BIN-linux-386 |"
+            echo
+            echo "Verify: sha256sum -c checksums-sha256.txt"
+          } > notes.md
+          cat notes.md
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.meta.outputs.tag }}
+          target_commitish: ${{ github.sha }}
+          name: ${{ needs.meta.outputs.tag }}
+          body_path: notes.md
+          files: dist/*
+          generate_release_notes: true
+          make_latest: true
