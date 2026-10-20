@@ -36,7 +36,7 @@ pub struct Config {
     pub on_frame: Box<dyn FnMut(&[u8], usize, usize) + Send>,
     /// The Windows computer's name, once it accepts the session.
     pub on_peer_changed: Box<dyn FnMut(&str) + Send>,
-    /// Ask Windows to stream its computer audio.
+    /// Ask Windows to stream its computer audio from the start.
     pub sound: bool,
     /// 48 kHz stereo s16le PCM.
     pub on_audio: Box<dyn FnMut(&[u8]) + Send>,
@@ -58,6 +58,8 @@ pub enum Event {
     Key(winit::keyboard::KeyCode, bool),
     /// Lift every held key and button, e.g. when the window loses focus.
     ReleaseAll,
+    /// Turn the Windows computer's audio on or off.
+    Sound(bool),
     /// Sent by the app to end the session.
     Quit,
 }
@@ -285,6 +287,7 @@ struct Session {
     view_only: bool,
     origin: (i32, i32),
     audio: Option<G722>,
+    sound: bool,
     sound_requested: bool,
 }
 
@@ -301,13 +304,14 @@ pub fn run(cfg: Config, partner_id: &str, password: &str, tx: SyncSender<Event>,
     let mut cmd = RelayConn::open(stream, COMMAND_HOST, Source::Command, tx.clone())?;
     cmd.send(&system_envelope(&CommandCipher::server().encrypt(reg_text.as_bytes()), true))?;
     let correlation = random_string(9, b"0123456789").parse::<i32>().expect("digits") + 1;
+    let sound = cfg.sound;
     let mut s = Session {
         cfg, partner_id: partner_id.into(), password: password.into(),
         hash: random_string(16, b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"),
         correlation, phase: Phase::Registering, cmd, peer: None, assigned_id: String::new(), info: None,
         target: Ipv4::default(), target_port: 0, render: None, accepted: false, refreshes: 0,
         deadline: Some(Instant::now() + STEP_TIMEOUT), next_heartbeat: None, ticks: 0,
-        mouse: MouseEncoder::default(), keyboard: KeyboardEncoder::default(), keyboard_ok: false, view_only: false, origin: (0, 0), audio: None, sound_requested: false,
+        mouse: MouseEncoder::default(), keyboard: KeyboardEncoder::default(), keyboard_ok: false, view_only: false, origin: (0, 0), audio: None, sound, sound_requested: false,
     };
     loop {
         let wake = [s.deadline, s.next_heartbeat].into_iter().flatten().min();
@@ -343,6 +347,7 @@ pub fn run(cfg: Config, partner_id: &str, password: &str, tx: SyncSender<Event>,
             Ok(Event::Mouse(m)) => s.on_mouse(m)?,
             Ok(Event::Key(code, pressed)) => s.on_key(code, pressed)?,
             Ok(Event::ReleaseAll) => s.release_all()?,
+            Ok(Event::Sound(on)) => s.set_sound(on)?,
         }
     }
 }
@@ -386,7 +391,11 @@ impl Session {
                 return Err(WRONG_PASSWORD.into());
             }
             let Some(info) = reply.peer else {
-                return Err(format!("UltraViewer declined the partner lookup (code {})", reply.status).into());
+                return Err(match reply.status {
+                    // Seen for an ID that doesn't exist or isn't online.
+                    11 => "UltraViewer couldn't find that computer (code 11). Check the ID and that UltraViewer is running on it.".into(),
+                    code => format!("UltraViewer declined the partner lookup (code {code})").into(),
+                });
             };
             (self.target, self.target_port, self.phase) = (info.public_ip, info.target_port, Phase::LoggingIn);
             (self.cfg.on_status)("Connecting to the Windows computer…");
@@ -475,7 +484,7 @@ impl Session {
             }
             27 | 41 | 54 => Err(CLOSED.into()),
             39 => Err("the Windows computer blocked this connection".into()),
-            42 | 43 if self.phase == Phase::Active && self.cfg.sound => {
+            42 | 43 if self.phase == Phase::Active && self.sound => {
                 let decoder = match &mut self.audio {
                     Some(d) => d,
                     None => self.audio.insert(G722::new()?),
@@ -539,13 +548,21 @@ impl Session {
         (self.cfg.on_status)(&status);
         self.accepted = true;
         self.send_to_peer(b"17")?;
-        if self.cfg.sound && !self.sound_requested {
-            self.sound_requested = true;
-            // RemoteControlCommands.computerSound(enabled: true), sent as UTF-16LE.
-            let text: Vec<u8> = "46|||-1".encode_utf16().flat_map(u16::to_le_bytes).collect();
-            self.send_to_peer_flagged(&text, true)?;
+        if self.sound && !self.sound_requested {
+            self.set_sound(true)?;
         }
         Ok(())
+    }
+
+    /// RemoteControlCommands.computerSound, sent as UTF-16LE.
+    fn set_sound(&mut self, on: bool) -> Result<()> {
+        self.sound = on;
+        if self.phase != Phase::Active {
+            return Ok(()); // sent once the screen arrives
+        }
+        self.sound_requested = true;
+        let text: Vec<u8> = format!("46|||{}", if on { -1 } else { 0 }).encode_utf16().flat_map(u16::to_le_bytes).collect();
+        self.send_to_peer_flagged(&text, true)
     }
 
     /// Sends pointer input while Windows allows control; coordinates are clamped to

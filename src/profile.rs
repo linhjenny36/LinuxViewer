@@ -1,5 +1,5 @@
-//! The install identity and the machine details sent in registration
-//! (MacRegistrationProfile.swift).
+//! What uvview keeps between runs: the install identity and machine details sent in
+//! registration (MacRegistrationProfile.swift), recent partner IDs, and saved passwords.
 
 use crate::messages::Registration;
 use crate::wire::{hex, random_bytes, random_string, Result};
@@ -26,9 +26,14 @@ pub(crate) fn json_field(text: &str, key: &str) -> Option<String> {
     Some(rest[..rest.find('"')?].to_string())
 }
 
-pub fn load_registration() -> Result<Registration> {
+fn app_dir() -> Result<PathBuf> {
     let dir = config_dir()?.join("macviewer-linux");
     fs::DirBuilder::new().recursive(true).mode(0o700).create(&dir)?;
+    Ok(dir)
+}
+
+pub fn load_registration() -> Result<Registration> {
+    let dir = app_dir()?;
     let path = dir.join("registration.json");
     let (identity, password) = match fs::read_to_string(&path) {
         Ok(text) => match (json_field(&text, "deviceIdentity"), json_field(&text, "password")) {
@@ -85,6 +90,58 @@ fn kernel_version() -> String {
     let v: Vec<u32> = release.split(|c: char| !c.is_ascii_digit()).filter(|s| !s.is_empty()).take(3).map(|s| s.parse().unwrap_or(0)).collect();
     let at = |i: usize| v.get(i).copied().unwrap_or(0);
     format!("{}|{}|0|{}|0|0", at(2), at(0), at(1))
+}
+
+const MAX_RECENTS: usize = 10;
+
+/// Partner IDs that connected successfully, newest first.
+pub fn load_recents() -> Vec<String> {
+    let Ok(dir) = app_dir() else { return vec![] };
+    let text = fs::read_to_string(dir.join("recents.txt")).unwrap_or_default();
+    text.lines().filter(|l| !l.is_empty() && l.bytes().all(|b| b.is_ascii_digit())).take(MAX_RECENTS).map(String::from).collect()
+}
+
+/// Moves `id` to the front and returns the new list.
+pub fn add_recent(id: &str) -> Vec<String> {
+    let mut list = load_recents();
+    list.retain(|r| r != id);
+    list.insert(0, id.to_string());
+    list.truncate(MAX_RECENTS);
+    if let Ok(dir) = app_dir() {
+        let _ = fs::write(dir.join("recents.txt"), list.join("\n") + "\n");
+    }
+    list
+}
+
+pub fn clear_recents() {
+    for id in load_recents() {
+        forget_password(&id);
+    }
+    if let Ok(dir) = app_dir() {
+        let _ = fs::remove_file(dir.join("recents.txt"));
+    }
+}
+
+// Passwords live in the desktop keyring (Secret Service), one entry per partner ID.
+// Keyring calls can block on D-Bus, so callers run them off the UI thread.
+
+fn keyring_entry(id: &str) -> Option<keyring::Entry> {
+    keyring::Entry::new("uvview", id).ok()
+}
+
+pub fn saved_password(id: &str) -> Option<String> {
+    keyring_entry(id)?.get_password().ok()
+}
+
+pub fn save_password(id: &str, password: &str) -> Result<()> {
+    let entry = keyring_entry(id).ok_or("the system keyring is unavailable")?;
+    entry.set_password(password).map_err(|e| format!("couldn't save the password: {e}").into())
+}
+
+pub fn forget_password(id: &str) {
+    if let Some(e) = keyring_entry(id) {
+        let _ = e.delete_credential();
+    }
 }
 
 #[cfg(test)]
