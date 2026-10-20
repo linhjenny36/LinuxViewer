@@ -9,6 +9,10 @@ on:
 permissions:
   contents: read
 
+env:
+  CARGO_PROFILE_RELEASE_STRIP: symbols
+  CARGO_PROFILE_RELEASE_LTO: "true"
+
 jobs:
   test:
     runs-on: ubuntu-latest
@@ -57,16 +61,16 @@ jobs:
   build:
     needs: test
     if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - { target: x86_64-unknown-linux-gnu,  os: ubuntu-latest }
-          - { target: aarch64-unknown-linux-gnu, os: ubuntu-latest, cross: true }
-          - { target: x86_64-apple-darwin,       os: macos-latest }
-          - { target: aarch64-apple-darwin,      os: macos-latest }
-          - { target: x86_64-pc-windows-msvc,    os: windows-latest }
-    runs-on: ${{ matrix.os }}
+        target:
+          - x86_64-unknown-linux-musl        # PCs, servers
+          - aarch64-unknown-linux-musl       # Pi 4/5 64-bit, ARM servers
+          - armv7-unknown-linux-musleabihf   # Pi 2/3/4 32-bit
+          - arm-unknown-linux-musleabihf     # Pi Zero/1 (ARMv6)
+          - i686-unknown-linux-musl          # old 32-bit x86
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -75,46 +79,86 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: ${{ matrix.target }}
-      - if: matrix.cross
-        uses: taiki-e/install-action@cross
+      - uses: taiki-e/install-action@cross
 
       - name: Build
-        shell: bash
-        run: |
-          if [ "${{ matrix.cross }}" = "true" ]; then
-            cross build --release --locked --target ${{ matrix.target }}
-          else
-            cargo build --release --locked --target ${{ matrix.target }}
-          fi
+        run: cross build --release --locked --target ${{ matrix.target }}
 
       - name: Package
-        shell: bash
         run: |
           set -euo pipefail
           T="${{ matrix.target }}"
           NAME="${GITHUB_REPOSITORY#*/}-${GITHUB_REF_NAME}-${T}"
           mkdir -p "dist/$NAME"
-          EXT=""; [[ "$T" == *windows* ]] && EXT=".exe"
           for bin in $(cargo metadata --no-deps --format-version 1 \
                         | jq -r '.packages[].targets[] | select(.kind[] == "bin") | .name'); do
-            cp "target/$T/release/${bin}${EXT}" "dist/$NAME/"
+            cp "target/$T/release/$bin" "dist/$NAME/"
           done
           for f in README* LICENSE*; do [ -e "$f" ] && cp "$f" "dist/$NAME/"; done
-          cd dist
-          if [[ "$T" == *windows* ]]; then
-            7z a "$NAME.zip" "$NAME" >/dev/null
-          else
-            tar czf "$NAME.tar.gz" "$NAME"
-          fi
-          rm -rf "$NAME"
+          tar czf "dist/$NAME.tar.gz" -C dist "$NAME"
+          rm -rf "dist/$NAME"
 
       - uses: actions/upload-artifact@v4
         with:
           name: dist-${{ matrix.target }}
-          path: dist/*
+          path: dist/*.tar.gz
+
+  verify:
+    needs: build
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-musl
+            platform: linux/amd64
+            images: alpine:latest debian:stable-slim ubuntu:18.04 fedora:latest archlinux:latest busybox:latest
+          - target: aarch64-unknown-linux-musl
+            platform: linux/arm64
+            images: alpine:latest debian:stable-slim ubuntu:18.04 fedora:latest busybox:latest
+          - target: armv7-unknown-linux-musleabihf
+            platform: linux/arm/v7
+            images: alpine:latest debian:stable-slim ubuntu:18.04 busybox:latest
+          - target: arm-unknown-linux-musleabihf
+            platform: linux/arm/v6
+            images: alpine:latest busybox:latest
+          - target: i686-unknown-linux-musl
+            platform: linux/386
+            images: alpine:latest busybox:latest
+    steps:
+      - uses: docker/setup-qemu-action@v3
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist-${{ matrix.target }}
+          path: dist
+
+      - name: Check static linking and run on distros
+        run: |
+          set -uo pipefail
+          mkdir x && tar xzf dist/*.tar.gz -C x
+          fail=0
+          for bin in $(find x -type f -perm -u+x ! -name 'README*' ! -name 'LICENSE*'); do
+            echo "=== $bin"
+            file "$bin"
+            if ! file "$bin" | grep -qE 'statically linked|static-pie linked'; then
+              echo "::error::$bin is not statically linked"; fail=1
+            fi
+            for img in ${{ matrix.images }}; do
+              timeout 60 docker run --rm --platform ${{ matrix.platform }} \
+                -v "$PWD/x:/x:ro" "$img" "/$bin" --version
+              code=$?
+              case $code in
+                125|126|127|132|134|135|139)
+                  echo "::error::$bin failed on $img (exit $code)"; fail=1 ;;
+                *)
+                  echo "✓ $img (exit $code)" ;;
+              esac
+            done
+          done
+          exit $fail
 
   release:
-    needs: build
+    needs: verify
     runs-on: ubuntu-latest
     permissions:
       contents: write
